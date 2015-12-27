@@ -1,0 +1,1144 @@
+---
+title: "Practical Machine Learning - Assignment"
+author: "adrianvs"
+date: "25 Dec 2015"
+output: html_document
+---
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(caret); library(dplyr); library(ggplot2); library(xtable); library(htmlTable)
+library(reshape2); library(viridis); library(doParallel); library(knitr); library(gridExtra)
+library(randomForest); library(rfUtilities)
+
+```
+
+## Introduction  
+The aim of this assignement is to fit and evaluate a prediction model to qualitatively asses the
+movement patterns of biceps curls. Sensory data of four inertial measurement units sampling at
+45 Herz is provided. Each unit records acceleration in three axes, gyroscope and magnetometer data.
+The training data consists of measurements of 6 participants performing one set of 10 repetitions
+in five different movement patterns:  
+
+* A: correct movement
+* B: throwing the elbows to the front
+* C: lifting the dumbbell only halfway
+* D: lowering the dumbbell only halfway
+* E: throwing the hips to the front  
+
+The complete R-Code can be found in the Appendix.
+
+## Data Preparation
+
+```{r}
+setwd("~/Desktop/PracticalMachineLearning")
+
+data <- read.csv("pml-training.csv", stringsAsFactors = FALSE)  # read the data into R
+data$classe <- factor(data$classe)                              # make outcome variable a factor
+
+```
+
+In the origninal [report](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf)
+Velloso et al. took overlapping windows from the time series data (2.5 sec) and calculated summary 
+statistics to use as features for their prediction model (kurtosis, skewness, maximum, minimum, 
+amplitude, variance, mean and standard deviation).  
+Since the testing data provided for in this assignement consists only of single data entries 
+(snapshots) a timeseries approach is not possible. Therefore those calculated summary statistics 
+in the training data set can be discarded. The timestamp variables are not synchronised to the 
+beginning or end of the movement and no information about timing within a exercise can be gained 
+from a single timestamp; they will be discarded as well.
+
+```{r}
+# Create subset of possible features
+df <- data %>% 
+        select(-grep("kurtosis|skewness|max|min|amplitude|var|avg|stddev",names(data), value =F)) %>%
+        select(-new_window, -cvtd_timestamp, -user_name, -X, 
+               -raw_timestamp_part_1,-raw_timestamp_part_2, -num_window)
+```
+
+
+
+The 52 remaining variables are the possible prediction features. Before any further analysis the 
+model building data set will pe partitioned into a training and a test set.
+
+```{r}
+#Partitioning the data set
+set.seed(1984)
+inTrain <- createDataPartition(df$classe, p=0.6, list = FALSE)
+training <- df[inTrain,]
+testing <- df[-inTrain,]
+```
+
+
+|              | Training              | Testing             |
+|--------------|-----------------------|---------------------|
+|Observations  |`r dim(training)[1]`   |`r dim(testing)[1]`  |
+|Variables     |`r dim(training)[2]`   |`r dim(testing)[2]`  |  
+
+**Table 1: Partitioning Dimensions**
+<br><br>
+
+
+## Exploratory Data Analysis
+
+### Linear Dependencies
+
+To see whether any variable is a scalar multiple of another variable or a linear combination of multiple
+other variables and can therefore be left out of the modelling process, linear dependency of the training 
+data is tested.
+```{r, comment=""}
+# Detect linear combinations
+trainMatrix <- as.matrix(training[,-53])
+findLinearCombos(trainMatrix)$linearCombos$list
+```
+There are no linear dependencies in the training data.
+
+
+### Correlation
+
+To asses the correlation within the training data, the variables that most reduce the pair-wise
+correlation when removed are identified:
+```{r, fig.width=10, fig.height=10, results='asis'}
+# Detect variables responsible for high pair-wise correlation
+corMatrix <- cor(training[,-53])                                # calculate correlation matrix
+highCors <- findCorrelation(corMatrix, cutoff = .9,             # find variables responsible for
+                             names = TRUE, exact = TRUE)        # high pair-wise correlation
+```
+```{r, fig.width=10, fig.height=10, results='asis', echo=FALSE}
+# Create html table
+htmlTable(as.data.frame(highCors), align = "rrrr", header = "Variable Names",
+          caption = "If those variables are removed, pair-wise correlation
+                        drops below 0.9")
+```
+
+<br><br>
+
+A broader overview can be gained by calculating a cross-correlation heatmap.
+```{r, fig.width=10, fig.height=9, echo=FALSE}
+# Create correlation matrix in long format
+corMatrix <- melt(abs(cor(training[,-53])))                     # bring matrix into long format
+ggplot(corMatrix, aes(x = Var1, y = Var2, fill = value)) +      # plot heatmap
+        geom_tile() + 
+        theme_classic() +
+        scale_fill_viridis(discrete=FALSE) +
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        ggtitle(expression(atop("Correlation Heatmap", 
+                        atop(italic("absolute values"), "")))) +
+        labs(x="", y="") 
+```
+**Plot 1: Cross-Correlation Heatmap**  
+
+<br><br>  
+
+Some areas of higher correlation espacialliy within variables originating from the same sensors 
+(see belt variables in the bottom left) can be observed. 
+If a modelling approach is chosen, that is sensible to high co-linearity the pair-wise correlation
+in the data should be reduced.
+
+### Near Zero Variance
+
+Variables that vary only marginally across the observations do not add information to the model and
+can be removed.
+```{r, comment=""}
+nearZeroVar(training)                                           # testing for near zero variance
+```
+There are no variables with near zero variance in the training set.
+
+
+### Distribution
+
+Histograms of the normalised variables show their distributions.
+```{r, comment="", message=FALSE, warning=FALSE, fig.width=12, fig.height=12, echo=FALSE}
+# Normalise the data
+trainNorm <- as.data.frame(scale(training[,-53]))
+trainNorm$classe <- training$classe
+
+# Bring normalised data into long format
+trainMelt <- melt(trainNorm)
+
+# Plot histograms for each variable, classe colored
+ggplot(trainMelt, aes(x = value, fill = classe)) +
+        scale_x_continuous(limits = c(-4, 4)) +
+        facet_wrap(~ variable) +
+        geom_histogram(binwidth = .5) +
+        theme_classic() +
+        scale_fill_viridis(discrete=TRUE) +
+        ggtitle(expression(atop("Histogram", 
+                        atop(italic("stacked by classe, normalised data"), "")))) +
+        labs(x="", y="") 
+
+```
+**Plot 2: Histograms of all 52 possible Features**  
+
+<br><br>
+
+Many of the variables are not normaly distributed without an obvious transformation to a alleviate the problem. 
+The choice of modelling algorithm should reflect this caveat.
+For further analysis see the Violin-Jitter plots in the appendix.
+
+<br><br>
+
+## Model Building
+
+To model this data, an algorithm that can handle multinomial classification on 
+a data set affected by some multicoliniearity and many variables that are clearly 
+not normaly distributed is needed.
+In this setting the Random Forest is a robust algorithm.
+
+### Strategy
+
+In tuning the model three error metrics will be considered: 
+
+* The Out-of-Bag error rate: Each data point is run down every tree it was not used to grow. (Model inherent cross-validation)
+* The Cross-Validation error rate: repeated k-fold cross-validation
+* The Out-of-Sample error rate on the testing set  
+
+
+The strategy follows a 3 partition aproach. The train data will be split into a training and a 
+testing data set, the 20 test cases will serve as validation data.  
+To find the right tuning parameters four models with four different numbers of trees in the forest
+(200,500,1000,2000) will be trained and evaluated. After the best fitting model is chosen three
+different mtry values (number of  randomly sampled variables that can be split upon at each node)
+will be tested; the square root of the variable number, its double and its half.
+If the results show that the OOB and CV error rates are good approximations for the real 
+out of sample error, the final model will be trained on the whole data set with the 
+evaluated tuning parameters and validated on the 20 test cases.
+
+
+
+```{r, message=FALSE , warning=FALSE, eval=FALSE}
+#Fitting 4 RF Models
+set.seed(1984)
+mod1 <- randomForest(y = training$classe, x = training[,-53], ntree = 200, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+mod2 <- randomForest(y = training$classe, x = training[,-53], ntree = 500, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+mod3 <- randomForest(y = training$classe, x = training[,-53], ntree = 1000, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+mod4 <- randomForest(y = training$classe, x = training[,-53], ntree = 2000, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+
+# Cross-validating those 4 models
+set.seed(1984)
+mod1CV <- rf.crossValidation(mod1, xdata = training[,-53], 
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+mod2CV <- rf.crossValidation(mod2, xdata = training[,-53], 
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+mod3CV <- rf.crossValidation(mod3, xdata = training[,-53],
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+mod4CV <- rf.crossValidation(mod3, xdata = training[,-53],
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+```
+```{r, echo=FALSE}
+load("mod1.RData"); load("mod2.RData"); load("mod3.RData"); load("mod4.RData");
+load("mod1CV.RData"); load("mod2CV.RData"); load("mod3CV.RData"); load("mod4CV.RData"); 
+```
+
+<br><br>  
+
+
+### ntree Tuning
+
+The following plot compares the OOB-, cross-validation and the out-of-sample (test set)
+error rate for the three different models.
+
+```{r, message=FALSE , warning=FALSE, results='asis', echo=FALSE}
+
+# Create a list of models and CV-data
+errorList <- list(mod1CV, mod2CV, mod3CV, mod4CV)
+modelList <- list(mod1, mod2, mod3, mod4)
+
+# Create a long format data frame with CV and OOB errors for all 4 models
+statDf    <- melt(data.frame(
+                        mod1CV  = mod1CV$Error.distribution,
+                        mod1OOB = mod1CV$OOB.distribution,
+                        mod2CV  = mod2CV$Error.distribution,
+                        mod2OOB = mod2CV$OOB.distribution,
+                        mod3CV  = mod3CV$Error.distribution,
+                        mod3OOB = mod3CV$OOB.distribution,
+                        mod4CV  = mod4CV$Error.distribution,
+                        mod4OOB = mod4CV$OOB.distribution))
+
+# Calculate standart error for confidence intervals (95%)
+statDfs <- statDf %>% group_by(variable) %>% 
+        summarise(mean = mean(value),
+                stdev  = sd(value),
+                se     = stdev/sqrt(20),
+                ci.up  = se * qt(0.975, df = 19),
+                ci.low = se * -qt(0.975, df = 19))
+
+# Name the statistical data frame and prepare for left_join (factor levels)
+statDfs <- 
+        cbind(c("model1","model1","model2","model2","model3","model3","model4","model4"),
+             c("Mean CV Error","OOB Error", "Mean CV Error","OOB Error","Mean CV Error",
+               "OOB Error","Mean CV Error","OOB Error"),
+             statDfs)
+names(statDfs) <- c("Model", "Error", "Variable", "mean", "stdev", "se", "ci.up", "ci.low")
+statDfs$Error <- factor(statDfs$Error, levels = c("Mean CV Error","OOB Error","Test Set Error"))
+
+# Set up empty data frame
+errorDf <- data.frame()
+
+# Fill data frame with calculated errors 
+for (i in 1:4) {
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        paste0("model",i),      
+                        "Mean CV Error",      
+                        errorList[[i]]$cv.Summary[4,1]))
+        
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        paste0("model",i),      
+                        "OOB Error",   
+                        mean(predict(modelList[[i]]) != training$classe)))
+     
+     errorDf <- rbind(errorDf,
+                      cbind( 
+                         paste0("model",i),
+                         "Test Set Error",
+                         mean(predict(modelList[[i]], newdata = testing ) != testing$classe)))
+}
+
+# Process data frame
+errorDf$V3 <- as.numeric(as.character(errorDf$V3))
+names(errorDf) <- c("Model", "Error", "Value")
+
+# Join it with the statistical data frame
+plotDf <- left_join(errorDf, statDfs)
+
+
+# Create an error bar chart by model with CI error bars where possible
+ggplot(plotDf, aes(x = Model, y = Value, fill = Model)) +
+        geom_bar(stat = "identity") +
+        geom_errorbar(aes(ymin = Value + ci.low, ymax = Value + ci.up), width = .3) +
+        theme_classic() +
+        ggtitle(expression(atop("Estimated Model Error Rate", 
+                        atop(italic("Model 1-4, 95% CI Error Bars"), "")))) +
+        scale_fill_viridis(discrete=TRUE)+
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        facet_wrap(~ Error)
+```  
+  
+**Plot 3: Cross-Validation, Out-Of-Bag and Out-Of-Sample Error**  
+
+<br><br>  
+
+The cross-validation error plateaus early, while the error rate on the testing set improves
+with higher tree numbers. The accuracy is already very high for all models.
+The confusion matrices for those models show only small differences and can be seen in the appendix.
+The plotted prediciton error by outcome class shows no systematic difference between the four models (see appendix).
+The stable CV error and reduced test set error point to a higher ntree number (2000) for the final model.
+
+<br><br>
+
+### mtry Tuning
+
+Model4 was run with the default mtry = sqrt(variable number) = 7, now its double and its half
+will be trained and evaluated.
+
+```{r, message=FALSE , warning=FALSE, eval=FALSE}
+# Train two more models using different mtry values
+set.seed(1984)
+mod4double <- randomForest(y = training$classe, x = training[,-53], ntree = 2000, 
+                           mtry = sqrt(52)*2, do.trace = TRUE, xtest = testing[,-53], 
+                           ytest = testing$classe, keep.forest = T)
+
+mod4half   <- randomForest(y = training$classe, x = training[,-53], ntree = 2000, 
+                           mtry = sqrt(52)*0.5, do.trace = TRUE, xtest = testing[,-53], 
+                           ytest = testing$classe, keep.forest = T)
+
+# Cross validate those two models
+set.seed(1984)
+mod4CVdouble <- rf.crossValidation(mod4double, xdata = training[,-53],
+                             p = 0.05, n = 20, plot = F, do.trace = T)
+
+mod4CVhalf   <- rf.crossValidation(mod4half, xdata = training[,-53],
+                             p = 0.05, n = 20, plot = F, do.trace = T)
+```
+
+```{r, echo=FALSE, message=FALSE , warning=FALSE}
+load("mod4double.RData"); load("mod4half.RData")
+load("mod4CVdouble.RData"); load("mod4CVhalf.RData")
+```
+
+```{r, echo=FALSE, message=FALSE , warning=FALSE}
+# Create a list of models and CV-data
+errorList <- list(mod4CV, mod4CVdouble, mod4CVhalf)
+modelList <- list(mod4, mod4double, mod4half)
+
+# Create a long format data frame with CV and OOB errors for the 3 models
+statDf    <- melt(data.frame(
+                        mod4CV        = mod4CV$Error.distribution,
+                        mod4OOB       = mod4CV$OOB.distribution,
+                        mod4doubleCV  = mod4CVdouble$Error.distribution,
+                        mod4doubleOOB = mod4CVdouble$OOB.distribution,
+                        mod4halfCV    = mod4CVhalf$Error.distribution,
+                        mod4halfOOB   = mod4CVhalf$OOB.distribution))
+
+# Create a statistic data frame for CI error bars calculation
+statDfs <- statDf %>% group_by(variable) %>% 
+        summarise(mean = mean(value),
+                stdev  = sd(value),
+                se     = stdev/sqrt(20),
+                ci.up  = se * qt(0.975, df = 19),
+                ci.low = se * -qt(0.975, df = 19))
+
+# Name and process that data frame
+statDfs <- 
+        cbind(c("model4","model4","model4double","model4double",
+                "model4half","model4half"),
+             c("Mean CV Error","OOB Error", "Mean CV Error","OOB Error","Mean CV Error",
+               "OOB Error"),
+             statDfs)
+names(statDfs) <- c("Model", "Error", "Variable", "mean", "stdev", "se", "ci.up", "ci.low")
+nam <- c("model4","model4double","model4half")
+statDfs$Error <- factor(statDfs$Error, levels = c("Mean CV Error","OOB Error","Test Set Error"))
+
+# Set up empty data frame
+errorDf <- data.frame()
+
+# Fill this data frame with the error values for those 3 models
+for (i in 1:3) {
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        nam[i],      
+                        "Mean CV Error",      
+                        errorList[[i]]$cv.Summary[4,1]))
+        
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        nam[i],      
+                        "OOB Error",   
+                        mean(predict(modelList[[i]]) != training$classe)))
+     
+     errorDf <- rbind(errorDf,
+                      cbind( 
+                         nam[i],  
+                         "Test Set Error",
+                         mean(predict(modelList[[i]], newdata = testing ) != testing$classe)))
+}
+# Process and name that data frame
+errorDf$V3 <- as.numeric(as.character(errorDf$V3))
+names(errorDf) <- c("Model", "Error", "Value")
+
+# Join it with the statistical data frame
+plotDf <- left_join(errorDf, statDfs)
+
+
+#  Create an error bar chart by model with CI error bars where possible
+ggplot(plotDf, aes(x = Model, y = Value, fill = Model)) +
+        geom_bar(stat = "identity") +
+        geom_errorbar(aes(ymin = Value + ci.low, ymax = Value + ci.up), width = .3) +
+        theme_classic() +
+        ggtitle(expression(atop("Estimated Model Error Rate", 
+                        atop(italic("mtry Permutations, 95% CI Error Bars"), "")))) +
+        scale_fill_viridis(discrete=TRUE)+
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        facet_wrap(~ Error)
+```  
+
+**Plot 4: Cross-Validation, Out-Of-Bag and Out-Of-Sample Error**  
+
+<br><br>  
+
+The original value for mtry seems to train the best model fit. The OOB error estimate decreases 
+marginally (but confidence intervals overlapp), but CV error and test set error increase with 
+different values.
+
+
+### Final Model
+Since in all models so far the OOB and CV error rate estimates seem to be a good predictor of
+the out-of-sample error rate, the final model will use the whole training data set and the 
+evaluated tuning criteria (ntree = 2000, mtry = sqrt(variable number))
+
+```{r, message=FALSE , warning=FALSE, eval=FALSE}
+# Train the final model
+set.seed(1984)
+finalModel <- randomForest(y = df$classe, x = df[,-53], ntree = 2000, mtry = sqrt(52),
+             do.trace = TRUE, keep.forest = T)
+
+# Cross validate the final model
+finalModelCV <- rf.crossValidation(finalModel, xdata = df[,-53],  
+                                      p = 0.05, n = 50, plot = F, do.trace = T)
+```
+
+```{r, echo=FALSE}
+load("finalModel.RData"); load("finalModelCV.RData")
+```
+CV and OOB error rate show a further improvement  compared to model 4. The OOB confusion matrix and 
+the 10 most important feature variables by mean decrease in Gini Index are shown below.
+
+```{r, results='asis', echo=FALSE, fig.width=12, fig.height=12, message=FALSE , warning=FALSE}
+# Create a long format data frame with CV and OOB errors for the final model
+statDf    <- melt(data.frame(
+                        finalModelCV        = finalModelCV$Error.distribution,
+                        finalModelOOB       = finalModelCV$OOB.distribution))
+
+# Create a statistic data frame for CI error bars calculation
+statDfs <- statDf %>% group_by(variable) %>% 
+        summarise(mean = mean(value),
+                stdev  = sd(value),
+                se     = stdev/sqrt(20),
+                ci.up  = se * qt(0.975, df = 19),
+                ci.low = se * -qt(0.975, df = 19))
+
+# Name and process that data frame
+statDfs <- cbind(c("finalModel","finalModel"),
+                 c("Mean CV Error","OOB Error"),
+                 statDfs)
+
+names(statDfs) <- c("Model", "Error", "Variable", "mean", "stdev", "se", "ci.up", "ci.low")
+statDfs$Error <- factor(statDfs$Error, levels = c("Mean CV Error","OOB Error"))
+
+# Set up empty data frame
+errorDf <- data.frame()
+
+# Fill this data frame with the error values for those 3 models
+errorDf <- rbind(errorDf,
+                 cbind(
+                        "finalModel",      
+                        "Mean CV Error",      
+                        finalModelCV$cv.Summary[4,1]))
+        
+errorDf <- rbind(errorDf,
+                 cbind(
+                        "finalModel",      
+                        "OOB Error",   
+                        mean(predict(finalModel) != df$classe)))
+
+# Process and name that data frame
+errorDf$V3 <- as.numeric(as.character(errorDf$V3))
+names(errorDf) <- c("Model", "Error", "Value")
+
+# Join it with the statistical data frame
+plotDf <- left_join(errorDf, statDfs)
+
+
+#  Create an error bar chart by model with CI error bars 
+p1 <- ggplot(plotDf, aes(x = Error, y = Value, fill = Model)) +
+        geom_bar(stat = "identity", position = "dodge") +
+        geom_errorbar(aes(ymin = Value + ci.low, ymax = Value + ci.up), width = .2) +
+        geom_text(aes(label = round(Value,5), x = Error, y = 0.001, color = "grey")) +
+        theme_classic() +
+        theme(legend.position="none") +
+        ggtitle(expression(atop("Estimated  Final Model Error Rate", 
+                        atop(italic("95% CI Error Bars"), "")))) +
+        scale_fill_viridis(discrete=TRUE)+
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        ylim(0, 0.007)
+        
+
+# Create OOB confusion matric plot
+# predict without new data on RF object gives the OOB predictions on training data
+M <- confusionMatrix(predict(finalModel), df$classe)
+
+
+
+p2 <- ggplot(as.data.frame(M$table), 
+                   aes(x = Prediction, y = Reference, fill = log(Freq+1))) +
+                geom_tile() +
+                geom_text(aes(label = Freq)) +
+                scale_fill_viridis(discrete=FALSE) +
+                ggtitle(paste0("OOB Confusion Matrix Final Model",i)) +
+                theme_classic()
+
+
+# Create data frame for variable importance plot
+# adapted from:
+# Function author: ramhiser
+# See https://gist.github.com/ramhiser/6dec3067f087627a7a85
+var_importance <- data_frame(variable=setdiff(colnames(training), "classe"),
+                        importance=as.vector(importance(finalModel)))
+var_importance <- arrange(var_importance, desc(importance))
+var_importance$variable <- factor(var_importance$variable,
+                          levels=var_importance$variable)
+
+p3 <- ggplot(head(var_importance,10), 
+                          aes(x=variable, weight=importance, fill=variable))  +
+                        geom_bar() + coord_flip() +
+                        ggtitle("Variable Importance Final Model") +
+                        xlab("") + 
+                        ylab("Variable Importance (Mean Decrease in Gini Index)") +
+                        scale_fill_viridis(discrete = TRUE, name="Variable Name") +
+                        theme_classic() +
+                        theme(axis.text.y=element_blank()) 
+
+# plot 3 analytic plots on one grid
+grid.arrange(p1,p2,p3, layout_matrix = matrix(c(1,3,2,3), ncol =2))
+```
+**Plot 5: Error Rates, OOB Confusion Matrix and Variable Importance PLot - Final Model**  
+
+<br><br>  
+The following two tables show the statistical details of the final model. 
+The OOB estimated error rate is below 0.3%!
+
+```{r, results="asis", echo=FALSE}
+htmlTable(txtRound(as.matrix(M$overall),4), 
+          header = c("Final Model"), rnames = c("Accuracy","Kappa", "Acc 95% CI lower", 
+                                          "Acc 95% CI upper", 
+                                          "No Information Rate", "P-Value (Acc > NIR)",
+                                           "Mcnemar's Test P-Value"))
+```
+**Table 2: Accuracy Statistics - Final Model**  
+<br><br>  
+
+```{r, results="asis", echo=FALSE}
+
+htmlTable(txtRound(M$byClass,3), caption = "Final Model",
+          header = c("","Sensitivity ", "Specificity ", "PPV", " NPV  ", 
+                     " Detection Rate  ", " Detection Prevalence  ", " Balanced Accuracy  "),
+          align = "rrrrrr")
+```
+**Table 3: Statistics by Class - Final Model**  
+<br><br>  
+
+## Validation
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("~/Desktop/PracticalMachineLearning")
+# Read in Validation Data
+validation <- read.csv("pml-testing.csv", stringsAsFactors = FALSE)
+
+# Preprocess like the training data
+validation <- validation %>% 
+        select(-grep("kurtosis|skewness|max|min|amplitude|var|avg|stddev",names(data), value =F)) %>%
+        select(-new_window, -cvtd_timestamp, -user_name, -X, 
+               -raw_timestamp_part_1,-raw_timestamp_part_2, -num_window)
+
+# Predict class outcome with final model 
+valPredictions <- predict(finalModel, newdata = validation)
+
+setwd("~/Desktop/PracticalMachineLearning/Predictions")
+
+# Write-up function
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+# Create files
+pml_write_files(valPredictions)
+
+```
+```{r}
+# Predict class outcome with final model 
+predict(finalModel, newdata = validation)
+```
+All 20 predictions were correct, but the sample size is to small for any further analysis.  
+<br><br>
+
+## Appendix
+
+### Additional Plots  
+
+A jitter plot overlayed with a violin shape of the normalise data can be used to assess the distribution
+of the different variables.
+
+```{r, comment="", message=FALSE, warning=FALSE, echo=FALSE}
+# Normalise the data
+trainNorm <- as.data.frame(scale(training[,-53]))
+trainNorm$classe <- training$classe
+
+# Create a function to plot the distributions for all 4 sensors
+explot <- function(expr) {
+        dat <- trainNorm %>% select(grep(expr, names(trainNorm), value = FALSE), classe)
+        tt <- melt(dat)
+
+        ggplot(tt, aes(x = classe, y=value)) +
+          geom_point(position = "jitter",aes(color = classe), alpha = .2) +
+          geom_violin(color = "black", fill = "grey", alpha = .6) +
+          scale_color_viridis(discrete=TRUE, guide=FALSE) +
+          facet_wrap(~ variable, scale="free_y") +
+          theme_classic() +
+          ggtitle(expression(atop("Violin-Jitter Plot", 
+                        atop(italic("normalised data"), "")))) +
+          labs(x="", y="") 
+}
+
+
+expr <- c("belt", "[^(fore)]arm", "forearm", "dumbbell")
+explot(expr[1])
+explot(expr[2])
+explot(expr[3])
+explot(expr[4])
+```
+
+
+The confusion marticies on the testing data of the first four models.
+```{r, fig.width=12, fig.height=10, echo=FALSE}
+# Create a list of models and CV-data
+errorList <- list(mod1CV, mod2CV, mod3CV, mod4CV)
+modelList <- list(mod1, mod2, mod3, mod4)
+
+# Create a list with predictions on the testing set with all 4 models
+predList <- lapply(modelList, predict, testing)
+
+# Create a list of confusion matrices from those predictions
+M <- lapply(predList, confusionMatrix, testing$classe)
+
+# Empty list for ggplot objects
+l <- list()
+
+# Create a confusion matrix ggplot object for each model
+for (i in 1:4) {
+  l[[i]] <- ggplot(as.data.frame(M[[i]]$table), 
+                   aes(x = Prediction, y = Reference, fill = log(Freq+1))) +
+                geom_tile() +
+                geom_text(aes(label = Freq)) +
+                scale_fill_viridis(discrete=FALSE) +
+                ggtitle(paste0("Confusion Matrix Model",i)) +
+                theme_classic()
+}
+# Plot those in a 2 by 2 grid
+grid.arrange(l[[1]],l[[2]],l[[3]],l[[4]], ncol = 2)
+```  
+
+The prediction error plot of the first four models.
+```{r, echo=FALSE}
+# Create a list with predictions on the testing set with all 4 models
+predList <- lapply(modelList, predict, testing)
+
+# Create a list of confusion matrices from those predictions
+M <- lapply(predList, confusionMatrix, testing$classe)
+# Empty list for ggplot objects
+l <- list()
+
+# Create a prediction error ggplot object for each model
+for(i in 1:4){
+        l[[i]] <- 
+        ggplot(data.frame(Prediction = predList[[i]], Reference = testing$classe), 
+                aes(x = Prediction, y= Reference, color = Reference)) +
+          geom_point(position = "jitter", alpha = 0.6, size = 3) +
+          scale_color_viridis(discrete=T) +
+          ggtitle(expression(atop("Prediction Error", 
+                        atop(italic("by classe"), "")))) +
+          theme_classic()
+}
+# Plot those in a 2 by 2 grid
+grid.arrange(l[[1]],l[[2]],l[[3]],l[[4]], ncol = 2)
+```  
+
+
+### Complete R Code
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE, eval=FALSE}
+library(caret); library(dplyr); library(ggplot2); library(htmlTable)
+library(reshape2); library(viridis); library(doParallel); library(knitr); library(gridExtra)
+library(randomForest); library(rfUtilities)
+
+setwd("~/Desktop/PracticalMachineLearning")
+
+data <- read.csv("pml-training.csv", stringsAsFactors = FALSE)  # read the data into R
+data$classe <- factor(data$classe)                              # make outcome variable a factor
+
+# Create subset of possible features
+df <- data %>% 
+        select(-grep("kurtosis|skewness|max|min|amplitude|var|avg|stddev",names(data), value =F)) %>%
+        select(-new_window, -cvtd_timestamp, -user_name, -X, 
+               -raw_timestamp_part_1,-raw_timestamp_part_2, -num_window)
+
+#Partitioning the data set
+set.seed(1984)
+inTrain <- createDataPartition(df$classe, p=0.6, list = FALSE)
+training <- df[inTrain,]
+testing <- df[-inTrain,]
+
+# Detect linear combinations
+trainMatrix <- as.matrix(training[,-53])
+findLinearCombos(trainMatrix)$linearCombos$list
+
+# Detect variables responsible for high pair-wise correlation
+corMatrix <- cor(training[,-53])                                # calculate correlation matrix
+highCors <- findCorrelation(corMatrix, cutoff = .9,             # find variables responsible for
+                             names = TRUE, exact = TRUE)        # high pair-wise correlation
+
+# Create html table
+htmlTable(as.data.frame(highCors), align = "rrrr", header = "Variable Names",
+          caption = "If those variables are removed, pair-wise correlation
+                        drops below 0.9")
+
+# Create correlation matrix in long format
+corMatrix <- melt(abs(cor(training[,-53])))                     # bring matrix into long format
+ggplot(corMatrix, aes(x = Var1, y = Var2, fill = value)) +      # plot heatmap
+        geom_tile() + 
+        theme_classic() +
+        scale_fill_viridis(discrete=FALSE) +
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        ggtitle(expression(atop("Correlation Heatmap", 
+                        atop(italic("absolute values"), "")))) +
+        labs(x="", y="") 
+
+nearZeroVar(training)                                           # testing for near zero variance
+
+# Normalise the data
+trainNorm <- as.data.frame(scale(training[,-53]))
+trainNorm$classe <- training$classe
+
+# Bring normalised data into long format
+trainMelt <- melt(trainNorm)
+
+# Plot histograms for each variable, classe colored
+ggplot(trainMelt, aes(x = value, fill = classe)) +
+        scale_x_continuous(limits = c(-4, 4)) +
+        facet_wrap(~ variable) +
+        geom_histogram(binwidth = .5) +
+        theme_classic() +
+        scale_fill_viridis(discrete=TRUE) +
+        ggtitle(expression(atop("Histogram", 
+                        atop(italic("stacked by classe, normalised data"), "")))) +
+        labs(x="", y="") 
+
+
+
+#Fitting 4 RF Models 
+set.seed(1984)
+mod1 <- randomForest(y = training$classe, x = training[,-53], ntree = 200, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+mod2 <- randomForest(y = training$classe, x = training[,-53], ntree = 500, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+mod3 <- randomForest(y = training$classe, x = training[,-53], ntree = 1000, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+mod4 <- randomForest(y = training$classe, x = training[,-53], ntree = 2000, mtry = sqrt(52),
+             do.trace = TRUE, xtest = testing[,-53], ytest = testing$classe, keep.forest = T)
+
+# Cross-validating those 4 models
+set.seed(1984)
+mod1CV <- rf.crossValidation(mod1, xdata = training[,-53], 
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+mod2CV <- rf.crossValidation(mod2, xdata = training[,-53], 
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+mod3CV <- rf.crossValidation(mod3, xdata = training[,-53],
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+mod4CV <- rf.crossValidation(mod3, xdata = training[,-53],
+                        p = 0.05, n = 20, plot = F, do.trace = T)
+
+
+# If models are already calculated
+load("mod1.RData"); load("mod2.RData"); load("mod3.RData"); load("mod4.RData");
+load("mod1CV.RData"); load("mod2CV.RData"); load("mod3CV.RData"); load("mod4CV.RData"); 
+
+
+# Create a list of models and CV-data
+errorList <- list(mod1CV, mod2CV, mod3CV, mod4CV)
+modelList <- list(mod1, mod2, mod3, mod4)
+
+# Create a long format data frame with CV and OOB errors for all 4 models
+statDf    <- melt(data.frame(
+                        mod1CV  = mod1CV$Error.distribution,
+                        mod1OOB = mod1CV$OOB.distribution,
+                        mod2CV  = mod2CV$Error.distribution,
+                        mod2OOB = mod2CV$OOB.distribution,
+                        mod3CV  = mod3CV$Error.distribution,
+                        mod3OOB = mod3CV$OOB.distribution,
+                        mod4CV  = mod4CV$Error.distribution,
+                        mod4OOB = mod4CV$OOB.distribution))
+
+# Calculate standart error for confidence intervals (95%)
+statDfs <- statDf %>% group_by(variable) %>% 
+        summarise(mean = mean(value),
+                stdev  = sd(value),
+                se     = stdev/sqrt(20),
+                ci.up  = se * qt(0.975, df = 19),
+                ci.low = se * -qt(0.975, df = 19))
+
+# Name the statistical data frame and prepare for left_join (factor levels)
+statDfs <- 
+        cbind(c("model1","model1","model2","model2","model3","model3","model4","model4"),
+             c("Mean CV Error","OOB Error", "Mean CV Error","OOB Error","Mean CV Error",
+               "OOB Error","Mean CV Error","OOB Error"),
+             statDfs)
+names(statDfs) <- c("Model", "Error", "Variable", "mean", "stdev", "se", "ci.up", "ci.low")
+statDfs$Error <- factor(statDfs$Error, levels = c("Mean CV Error","OOB Error","Test Set Error"))
+
+# Set up empty data frame
+errorDf <- data.frame()
+
+# Fill data frame with calculated errors 
+for (i in 1:4) {
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        paste0("model",i),      
+                        "Mean CV Error",      
+                        errorList[[i]]$cv.Summary[4,1]))
+        
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        paste0("model",i),      
+                        "OOB Error",   
+                        mean(predict(modelList[[i]]) != training$classe)))
+     
+     errorDf <- rbind(errorDf,
+                      cbind( 
+                         paste0("model",i),
+                         "Test Set Error",
+                         mean(predict(modelList[[i]], newdata = testing ) != testing$classe)))
+}
+
+# Process data frame
+errorDf$V3 <- as.numeric(as.character(errorDf$V3))
+names(errorDf) <- c("Model", "Error", "Value")
+
+# Join it with the statistical data frame
+plotDf <- left_join(errorDf, statDfs)
+
+
+# Create an error bar chart by model with CI error bars where possible
+ggplot(plotDf, aes(x = Model, y = Value, fill = Model)) +
+        geom_bar(stat = "identity") +
+        geom_errorbar(aes(ymin = Value + ci.low, ymax = Value + ci.up), width = .3) +
+        theme_classic() +
+        ggtitle(expression(atop("Estimated Model Error Rate", 
+                        atop(italic("Model 1-4, 95% CI Error Bars"), "")))) +
+        scale_fill_viridis(discrete=TRUE)+
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        facet_wrap(~ Error)
+
+# Train two more models using different mtry values
+set.seed(1984)
+mod4double <- randomForest(y = training$classe, x = training[,-53], ntree = 2000, 
+                           mtry = sqrt(52)*2, do.trace = TRUE, xtest = testing[,-53], 
+                           ytest = testing$classe, keep.forest = T)
+
+mod4half   <- randomForest(y = training$classe, x = training[,-53], ntree = 2000, 
+                           mtry = sqrt(52)*0.5, do.trace = TRUE, xtest = testing[,-53], 
+                           ytest = testing$classe, keep.forest = T)
+
+# Cross validate those two models
+set.seed(1984)
+mod4CVdouble <- rf.crossValidation(mod4double, xdata = training[,-53],
+                             p = 0.05, n = 20, plot = F, do.trace = T)
+
+mod4CVhalf   <- rf.crossValidation(mod4half, xdata = training[,-53],
+                             p = 0.05, n = 20, plot = F, do.trace = T)
+
+# If models are already calculated
+load("mod4double.RData"); load("mod4half.RData")
+load("mod4CVdouble.RData"); load("mod4CVhalf.RData")
+
+# Create a list of models and CV-data
+errorList <- list(mod4CV, mod4CVdouble, mod4CVhalf)
+modelList <- list(mod4, mod4double, mod4half)
+
+# Create a long format data frame with CV and OOB errors for the 3 models
+statDf    <- melt(data.frame(
+                        mod4CV        = mod4CV$Error.distribution,
+                        mod4OOB       = mod4CV$OOB.distribution,
+                        mod4doubleCV  = mod4CVdouble$Error.distribution,
+                        mod4doubleOOB = mod4CVdouble$OOB.distribution,
+                        mod4halfCV    = mod4CVhalf$Error.distribution,
+                        mod4halfOOB   = mod4CVhalf$OOB.distribution))
+
+# Create a statistic data frame for CI error bars calculation
+statDfs <- statDf %>% group_by(variable) %>% 
+        summarise(mean = mean(value),
+                stdev  = sd(value),
+                se     = stdev/sqrt(20),
+                ci.up  = se * qt(0.975, df = 19),
+                ci.low = se * -qt(0.975, df = 19))
+
+# Name and process that data frame
+statDfs <- 
+        cbind(c("model4","model4","model4double","model4double",
+                "model4half","model4half"),
+             c("Mean CV Error","OOB Error", "Mean CV Error","OOB Error","Mean CV Error",
+               "OOB Error"),
+             statDfs)
+names(statDfs) <- c("Model", "Error", "Variable", "mean", "stdev", "se", "ci.up", "ci.low")
+nam <- c("model4","model4double","model4half")
+statDfs$Error <- factor(statDfs$Error, levels = c("Mean CV Error","OOB Error","Test Set Error"))
+
+# Set up empty data frame
+errorDf <- data.frame()
+
+# Fill this data frame with the error values for those 3 models
+for (i in 1:3) {
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        nam[i],      
+                        "Mean CV Error",      
+                        errorList[[i]]$cv.Summary[4,1]))
+        
+     errorDf <- rbind(errorDf,
+                      cbind(
+                        nam[i],      
+                        "OOB Error",   
+                        mean(predict(modelList[[i]]) != training$classe)))
+     
+     errorDf <- rbind(errorDf,
+                      cbind( 
+                         nam[i],  
+                         "Test Set Error",
+                         mean(predict(modelList[[i]], newdata = testing ) != testing$classe)))
+}
+# Process and name that data frame
+errorDf$V3 <- as.numeric(as.character(errorDf$V3))
+names(errorDf) <- c("Model", "Error", "Value")
+
+# Join it with the statistical data frame
+plotDf <- left_join(errorDf, statDfs)
+
+
+#  Create an error bar chart by model with CI error bars where possible
+ggplot(plotDf, aes(x = Model, y = Value, fill = Model)) +
+        geom_bar(stat = "identity") +
+        geom_errorbar(aes(ymin = Value + ci.low, ymax = Value + ci.up), width = .3) +
+        theme_classic() +
+        ggtitle(expression(atop("Estimated Model Error Rate", 
+                        atop(italic("mtry Permutations, 95% CI Error Bars"), "")))) +
+        scale_fill_viridis(discrete=TRUE)+
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        facet_wrap(~ Error)
+
+
+# Train the final model
+set.seed(1984)
+finalModel <- randomForest(y = df$classe, x = df[,-53], ntree = 2000, mtry = sqrt(52),
+             do.trace = TRUE, keep.forest = T)
+
+# Cross validate the final model
+finalModelCV <- rf.crossValidation(finalModel, xdata = df[,-53],  
+                                      p = 0.05, n = 50, plot = F, do.trace = T)
+
+# If model is already calculated
+load("finalModel.RData"); load("finalModelCV.RData")
+
+# Create a long format data frame with CV and OOB errors for the final model
+statDf    <- melt(data.frame(
+                        finalModelCV        = finalModelCV$Error.distribution,
+                        finalModelOOB       = finalModelCV$OOB.distribution))
+
+# Create a statistic data frame for CI error bars calculation
+statDfs <- statDf %>% group_by(variable) %>% 
+        summarise(mean = mean(value),
+                stdev  = sd(value),
+                se     = stdev/sqrt(20),
+                ci.up  = se * qt(0.975, df = 19),
+                ci.low = se * -qt(0.975, df = 19))
+
+# Name and process that data frame
+statDfs <- cbind(c("finalModel","finalModel"),
+                 c("Mean CV Error","OOB Error"),
+                 statDfs)
+
+names(statDfs) <- c("Model", "Error", "Variable", "mean", "stdev", "se", "ci.up", "ci.low")
+statDfs$Error <- factor(statDfs$Error, levels = c("Mean CV Error","OOB Error"))
+
+# Set up empty data frame
+errorDf <- data.frame()
+
+# Fill this data frame with the error values for those 3 models
+errorDf <- rbind(errorDf,
+                 cbind(
+                        "finalModel",      
+                        "Mean CV Error",      
+                        finalModelCV$cv.Summary[4,1]))
+        
+errorDf <- rbind(errorDf,
+                 cbind(
+                        "finalModel",      
+                        "OOB Error",   
+                        mean(predict(finalModel) != df$classe)))
+
+# Process and name that data frame
+errorDf$V3 <- as.numeric(as.character(errorDf$V3))
+names(errorDf) <- c("Model", "Error", "Value")
+
+# Join it with the statistical data frame
+plotDf <- left_join(errorDf, statDfs)
+
+
+#  Create an error bar chart by model with CI error bars 
+p1 <- ggplot(plotDf, aes(x = Error, y = Value, fill = Model)) +
+        geom_bar(stat = "identity", position = "dodge") +
+        geom_errorbar(aes(ymin = Value + ci.low, ymax = Value + ci.up), width = .2) +
+        geom_text(aes(label = round(Value,5), x = Error, y = 0.001, color = "grey")) +
+        theme_classic() +
+        theme(legend.position="none") +
+        ggtitle(expression(atop("Estimated  Final Model Error Rate", 
+                        atop(italic("95% CI Error Bars"), "")))) +
+        scale_fill_viridis(discrete=TRUE)+
+        theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+        ylim(0, 0.007)
+        
+
+# Create OOB confusion matric plot
+# predict without new data on RF object gives the OOB predictions on training data
+M <- confusionMatrix(predict(finalModel), df$classe)
+
+
+
+p2 <- ggplot(as.data.frame(M$table), 
+                   aes(x = Prediction, y = Reference, fill = log(Freq+1))) +
+                geom_tile() +
+                geom_text(aes(label = Freq)) +
+                scale_fill_viridis(discrete=FALSE) +
+                ggtitle(paste0("OOB Confusion Matrix Final Model",i)) +
+                theme_classic()
+
+
+# Create data frame for variable importance plot
+# adapted from:
+# Function author: ramhiser
+# See https://gist.github.com/ramhiser/6dec3067f087627a7a85
+var_importance <- data_frame(variable=setdiff(colnames(training), "classe"),
+                        importance=as.vector(importance(finalModel)))
+var_importance <- arrange(var_importance, desc(importance))
+var_importance$variable <- factor(var_importance$variable,
+                          levels=var_importance$variable)
+
+p3 <- ggplot(head(var_importance,10), 
+                          aes(x=variable, weight=importance, fill=variable))  +
+                        geom_bar() + coord_flip() +
+                        ggtitle("Variable Importance Final Model") +
+                        xlab("") + 
+                        ylab("Variable Importance (Mean Decrease in Gini Index)") +
+                        scale_fill_viridis(discrete = TRUE, name="Variable Name") +
+                        theme_classic() +
+                        theme(axis.text.y=element_blank()) 
+
+# plot 3 analytic plots on one grid
+grid.arrange(p1,p2,p3, layout_matrix = matrix(c(1,3,2,3), ncol =2))
+
+# Table 2
+htmlTable(txtRound(as.matrix(M$overall),4), 
+          header = c("Final Model"), rnames = c("Accuracy","Kappa", "Acc 95% CI lower", 
+                                          "Acc 95% CI upper", 
+                                          "No Information Rate", "P-Value (Acc > NIR)",
+                                           "Mcnemar's Test P-Value"))
+
+# Table 3
+htmlTable(txtRound(M$byClass,3), caption = "Final Model",
+          header = c("","Sensitivity ", "Specificity ", "PPV", " NPV  ", 
+                     " Detection Rate  ", " Detection Prevalence  ", " Balanced Accuracy  "),
+          align = "rrrrrr")
+
+
+
+
+# Read in Validation Data
+validation <- read.csv("pml-testing.csv", stringsAsFactors = FALSE)
+
+# Preprocess like the training data
+validation <- validation %>% 
+        select(-grep("kurtosis|skewness|max|min|amplitude|var|avg|stddev",names(data), value =F)) %>%
+        select(-new_window, -cvtd_timestamp, -user_name, -X, 
+               -raw_timestamp_part_1,-raw_timestamp_part_2, -num_window)
+
+# Predict class outcome with final model 
+valPredictions <- predict(finalModel, newdata = validation)
+
+setwd("~/Desktop/PracticalMachineLearning/Predictions")
+
+# Write-up function
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+# Create files
+pml_write_files(valPredictions)
+
+```
